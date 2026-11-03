@@ -15,6 +15,15 @@ tools_dir="$(pwd)/tools"
 . "$tools_dir/utils.sh"
 . "$tools_dir/build_tools.sh"
 
+# -ikmf is the 4.0.306+ path (QEMU unpack, plaintext xz pack).
+# -qemu and -xzskip are aliases of -ikmf.
+function normalize_rootfs_flag () {
+    case "$1" in
+        -ikmf|-qemu|-xzskip) printf '%s\n' -ikmf ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
 function unpack_iso () {
     local file=$1
     local decode_flag="$2"
@@ -131,8 +140,9 @@ function unpack_rootfs () {
     if [ "$decode_flag" = "" ]; then
         decode_flag="-v1"
     fi
+    decode_flag="$(normalize_rootfs_flag "$decode_flag")"
 
-    if [ "$decode_flag" != "-v1" ] && [ "$decode_flag" != "-v2" ] && [ "$decode_flag" != "-v3" ]; then
+    if [ "$decode_flag" != "-v1" ] && [ "$decode_flag" != "-v2" ] && [ "$decode_flag" != "-v3" ] && [ "$decode_flag" != "-ikmf" ]; then
         log ERROR "Unknown rootfs decode version: $decode_flag"
         exit 1
     fi
@@ -148,13 +158,49 @@ function unpack_rootfs () {
         pub_key_opt="-u $public_key_file"
     fi
 
-    ensure_rootfs_tool
+    local use_qemu=0
+    if [ "$decode_flag" = "-ikmf" ]; then
+        use_qemu=1
+    else
+        if python3 - "$decode_file" "${2}" <<'PY'
+import sys
+from pathlib import Path
+blob = Path(sys.argv[1]).read_bytes()
+n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else len(blob)
+if n > len(blob):
+    n = len(blob)
+sys.exit(0 if n >= 0x294 and blob[n - 0x294 + 20:n - 0x294 + 24] == b"IKMF" else 1)
+PY
+        then
+            log INFO "IKMF trailer detected, using QEMU unpack"
+            use_qemu=1
+        fi
+    fi
 
-    log INFO "Decrypt rootfs ..."
-    "$tools_dir/rootfs" decrypt "$decode_file" "$work_dir/rootfs_decrypt" $decode_flag $initrd_length $pub_key_opt
-    if [ $? -ne 0 ]; then
-        log ERROR "Decrypt rootfs fail!"
-        exit 1
+    if [ "$use_qemu" = "1" ]; then
+        local qemu_len=()
+        if [ "$2" != "" ]; then
+            qemu_len=(-l "$2")
+        fi
+        log INFO "Decrypt rootfs via QEMU (official kernel) ..."
+        python3 "$tools_dir/qemu_unpack_initrd.py" \
+            "$unpack_dir/vmlinuz" "$decode_file" \
+            "$work_dir/rootfs_decrypt/rootfs.ext2" \
+            "${qemu_len[@]}"
+        if [ $? -ne 0 ]; then
+            log ERROR "QEMU decrypt rootfs fail!"
+            exit 1
+        fi
+        touch "$unpack_dir/.ikmf"
+    else
+        ensure_rootfs_tool
+
+        log INFO "Decrypt rootfs ..."
+        "$tools_dir/rootfs" decrypt "$decode_file" "$work_dir/rootfs_decrypt" $decode_flag $initrd_length $pub_key_opt
+        if [ $? -ne 0 ]; then
+            log ERROR "Decrypt rootfs fail!"
+            exit 1
+        fi
     fi
 
     if [ -f "$work_dir/rootfs_decrypt/end.gz" ]; then
@@ -202,7 +248,7 @@ function unpack () {
     local args=("$@")
     for ((i=0; i<${#args[@]}; i++)); do
         case "${args[i]}" in
-            -v1|-v2|-v3) decode_flag="${args[i]}" ;;
+            -v1|-v2|-v3|-ikmf|-qemu|-xzskip) decode_flag="${args[i]}" ;;
             -u) i=$((i+1)); public_key_file="${args[i]}" ;;
         esac
     done
@@ -366,6 +412,12 @@ function pack_rootfs () {
     local encrypt_flag="${5:--v2}"
     local private_key_file="$6"
 
+    encrypt_flag="$(normalize_rootfs_flag "$encrypt_flag")"
+    if [ "$encrypt_flag" = "-v2" ] && [ -f "$unpack_dir/.ikmf" ]; then
+        log INFO "IKMF unpack marker present, packing with -ikmf"
+        encrypt_flag="-ikmf"
+    fi
+
     if [ "$grub_file" = "__auto_iso_grub__" ]; then
         grub_file="$work_dir/grub.gz"
         build_iso_rootfs_grub "$grub_file"
@@ -443,13 +495,35 @@ function pack_rootfs () {
         exit 1
     fi
 
-    ensure_rootfs_tool
+    if [ "$encrypt_flag" = "-ikmf" ]; then
+        log INFO "Patch vmlinuz to skip IKMF when initrd is already xz"
+        python3 "$tools_dir/patch_vmlinuz_xzskip.py" \
+            "$unpack_dir/vmlinuz" "$work_dir/vmlinuz.xzskip"
+        if [ $? -ne 0 ]; then
+            log ERROR "Patch vmlinuz xz-skip fail!"
+            exit 1
+        fi
+        mv "$work_dir/vmlinuz.xzskip" "$unpack_dir/vmlinuz"
+        log INFO "Append 0x194 IKMF MD5 trailer for official ik_core"
+        python3 "$tools_dir/ikmf_sign_initrd.py" \
+            "$work_dir/rootfs.img.xz" "$work_dir/rootfs.img.xz.ikmf"
+        if [ $? -ne 0 ]; then
+            log ERROR "IKMF sign initrd fail!"
+            exit 1
+        fi
+        cp "$work_dir/rootfs.img.xz.ikmf" "$work_dir/rootfs.img.xz.bin"
+        if [ "$grub" != "" ]; then
+            cat "$grub_file" >> "$work_dir/rootfs.img.xz.bin"
+        fi
+    else
+        ensure_rootfs_tool
 
-    log INFO "Encrypt rootfs"
-    "$tools_dir/rootfs" encrypt "$work_dir/rootfs.img.xz" "$work_dir/rootfs.img.xz.bin" $encrypt_flag $grub $priv_key_opt
-    if [ $? -ne 0 ]; then
-        log ERROR "Encrypt rootfs fail!"
-        exit 1
+        log INFO "Encrypt rootfs"
+        "$tools_dir/rootfs" encrypt "$work_dir/rootfs.img.xz" "$work_dir/rootfs.img.xz.bin" $encrypt_flag $grub $priv_key_opt
+        if [ $? -ne 0 ]; then
+            log ERROR "Encrypt rootfs fail!"
+            exit 1
+        fi
     fi
     firmware_size=$(wc -c < "$work_dir/rootfs.img.xz.bin")
     initrd_length=$firmware_size
@@ -479,7 +553,7 @@ function pack_bin () {
     while [ $i -le $# ]; do
         arg="${!i}"
         case "$arg" in
-            -v1|-v2|-v3) encrypt_flag="$arg" ;;
+            -v1|-v2|-v3|-ikmf|-qemu|-xzskip) encrypt_flag="$arg" ;;
             -p) i=$((i+1)); private_key_file="${!i}" ;;
         esac
         i=$((i+1))
@@ -619,7 +693,7 @@ function pack_iso () {
     while [ $i -le $# ]; do
         arg="${!i}"
         case "$arg" in
-            -v1|-v2|-v3) encrypt_flag="$arg" ;;
+            -v1|-v2|-v3|-ikmf|-qemu|-xzskip) encrypt_flag="$arg" ;;
             -p) i=$((i+1)); private_key_file="${!i}" ;;
         esac
         i=$((i+1))
@@ -690,7 +764,7 @@ function patch () {
     local args=("$@")
     for ((i=0; i<${#args[@]}; i++)); do
         case "${args[i]}" in
-            -v1|-v2|-v3) decode_flag="${args[i]}" ;;
+            -v1|-v2|-v3|-ikmf|-qemu|-xzskip) decode_flag="${args[i]}" ;;
             -u) i=$((i+1)); public_key_file="${args[i]}" ;;
             -n) i=$((i+1)); new_public_key_file="${args[i]}" ;;
             -p) i=$((i+1)); private_key_file="${args[i]}" ;;
@@ -749,10 +823,17 @@ function patch () {
         fi
     fi
 
+    local pack_flag="$decode_flag"
+    if [ -f "$unpack_dir/.ikmf" ]; then
+        case "$(normalize_rootfs_flag "$decode_flag")" in
+            -ikmf|-v1) pack_flag="-ikmf" ;;
+        esac
+    fi
+
     if [ "$out_type" = "iso" ]; then
-        pack_iso "$firmware_id" "$version_arg" "$build_time" "$decode_flag" ${private_key_file:+-p "$private_key_file"}
+        pack_iso "$firmware_id" "$version_arg" "$build_time" "$pack_flag" ${private_key_file:+-p "$private_key_file"}
     elif [ "$out_type" = "bin" ]; then
-        pack_bin "$firmware_id" "$version_arg" "$build_time" "$decode_flag" ${private_key_file:+-p "$private_key_file"}
+        pack_bin "$firmware_id" "$version_arg" "$build_time" "$pack_flag" ${private_key_file:+-p "$private_key_file"}
     fi
 }
 
@@ -905,6 +986,12 @@ case "$1" in
         shift
         "$func" "$@"
     ;;
+    patch_kernel_ikmf|patch_kernel_xzskip)
+        shift
+        in_vmlinuz="${1:-$unpack_dir/vmlinuz}"
+        out_vmlinuz="${2:-$unpack_dir/vmlinuz}"
+        python3 "$tools_dir/patch_vmlinuz_xzskip.py" "$in_vmlinuz" "$out_vmlinuz"
+    ;;
     clean)
         clean_all
         clean_rootfs_tool
@@ -914,26 +1001,41 @@ case "$1" in
 Usage: $0 <command> [args...]
 
 Commands:
-  unpack <xxx.iso|xxx.bin> [-v1|-v2|-v3] [-u PUBLIC_KEY]
+  unpack <xxx.iso|xxx.bin> [-v1|-v2|-v3|-ikmf] [-u PUBLIC_KEY]
       unpack iso or bin file
       -u PUBLIC_KEY  Override RSA public key for v3 signature verification
+      -ikmf          4.0.306+ x64: boot official kernel in QEMU and dump plaintext xz
+                     IKMF images also auto-select this path without -ikmf
+                     -qemu and -xzskip are aliases of -ikmf
 
   patch_kernel -u OLD_PUBLIC_KEY -n NEW_PUBLIC_KEY [-i INPUT_VMLINUZ] [-o OUTPUT_VMLINUZ]
       patch embedded RSA public key in vmlinuz
       default input/output is $unpack_dir/vmlinuz
 
+  patch_kernel_ikmf [INPUT_VMLINUZ] [OUTPUT_VMLINUZ]
+      4.0.306+ x64: skip IKMF decrypt when initrd is already xz, and copy
+      the mapped initrd into j4m2zc/k7p9vn for stock ik_core
+      default input/output is $unpack_dir/vmlinuz
+      patch_kernel_xzskip is an alias
+
   pack_rootfs [firmware_id] [version] [build_time]
       pack rootfs
 
-  pack_bin [firmware_id] [version] [build_time] [-v1|-v2|-v3] [-p PRIVATE_KEY]
+  pack_bin [firmware_id] [version] [build_time] [-v1|-v2|-v3|-ikmf] [-p PRIVATE_KEY]
       pack bin file
       -v3 -p PRIVATE_KEY  Use v3 format with specified RSA private key for signing
+      -ikmf               plaintext xz + 0x194 IKMF MD5 trailer + kernel that
+                          skips IKMF decrypt and fills j4m2zc/k7p9vn
+                          (4.0.306+ x64, stock ik_core)
+                          auto-selected after an IKMF unpack
+                          -qemu and -xzskip are aliases of -ikmf
 
-  pack_iso [firmware_id] [version] [build_time] [-v1|-v2|-v3] [-p PRIVATE_KEY]
+  pack_iso [firmware_id] [version] [build_time] [-v1|-v2|-v3|-ikmf] [-p PRIVATE_KEY]
       pack iso file
       -v3 -p PRIVATE_KEY  Use v3 format with specified RSA private key for signing
+      -ikmf               same as pack_bin -ikmf
 
-  patch <xxx.bin|xxx.iso> <out_type:bin|iso> <patch_dir> [firmware_id] [version] [build_time] [-v1|-v2|-v3] [-u OLD_PUBLIC_KEY] [-n NEW_PUBLIC_KEY] [-p PRIVATE_KEY]
+  patch <xxx.bin|xxx.iso> <out_type:bin|iso> <patch_dir> [firmware_id] [version] [build_time] [-v1|-v2|-v3|-ikmf] [-u OLD_PUBLIC_KEY] [-n NEW_PUBLIC_KEY] [-p PRIVATE_KEY]
       patch iso or bin file
       -u OLD_PUBLIC_KEY  Override RSA public key for v3 unpack verification and vmlinuz patch source key
       -n NEW_PUBLIC_KEY  Automatically patch vmlinuz to the replacement RSA public key
@@ -963,12 +1065,14 @@ Examples:
   $0 unpack xxx.iso -v2
   $0 unpack xxx.iso -v3
   $0 unpack xxx.iso -v3 -u public.pem
+  $0 unpack xxx.iso -ikmf
   $0 patch_kernel -u old_public.pem -n new_public.pem
   $0 patch_kernel -i rootfs-unpack/vmlinuz -o work/vmlinuz.patched -u old_public.pem -n new_public.pem
   $0 unpack xxx.bin
   $0 pack_rootfs
   $0 pack_bin Id Version 0
   $0 pack_bin Id Version 0 -v3 -p private.pem
+  $0 pack_bin Id Version 0 -ikmf
   $0 pack_iso
   $0 pack_iso "" "" "" -v3 -p private.pem
   $0 patch xxx.iso iso patch_dir
